@@ -1,0 +1,185 @@
+diff -ruN a/app/src/main/java/com/mardous/booming/playback/LyricInfo.kt b/app/src/main/java/com/mardous/booming/playback/LyricInfo.kt
+--- a/app/src/main/java/com/mardous/booming/playback/LyricInfo.kt	1970-01-01 00:00:00.000000000 +0000
++++ b/app/src/main/java/com/mardous/booming/playback/LyricInfo.kt	2026-10-26 09:10:32.782104212 +0000
+@@ -0,0 +1,81 @@
++/*
++ * Publishes timed lyrics in the "lyricInfo" MediaMetadata format that ColorOS/OPlus
++ * SystemUI reads for its native lock-screen / AOD lyric page.
++ */
++
++package com.mardous.booming.playback
++
++import com.mardous.booming.data.model.Song
++import com.mardous.booming.data.model.lyrics.LyricsSource
++import com.mardous.booming.data.model.lyrics.ParsedLyrics
++import com.mardous.booming.data.model.lyrics.SyncedLyrics
++import com.mardous.booming.data.repository.LyricsRepository
++import org.json.JSONObject
++import java.util.Locale
++
++/** Key under which the JSON payload is stored in the MediaMetadata extras. */
++const val LYRIC_INFO_KEY = "lyricInfo"
++
++/**
++ * Resolves synced lyrics for [song] using the same source order as the lyrics screen
++ * (file, embedded, downloaded). Returns null when there are no synced lyrics.
++ */
++suspend fun resolveSyncedLyrics(repository: LyricsRepository, song: Song): SyncedLyrics? {
++    for (source in listOf(LyricsSource.File, LyricsSource.Embedded, LyricsSource.Downloaded)) {
++        val raw = when (source) {
++            LyricsSource.File -> repository.fileLyrics(song)
++            LyricsSource.Embedded -> repository.embeddedLyrics(song)
++            LyricsSource.Downloaded -> repository.storedLyrics(song, allowDownload = true)
++        } ?: continue
++        when (val parsed = repository.parseRawLyrics(song, raw)) {
++            is ParsedLyrics.Synced -> return parsed.lyrics
++            is ParsedLyrics.Instrumental -> return null
++            else -> Unit
++        }
++    }
++    return null
++}
++
++/** Builds the lyricInfo JSON string (line-timed LRC, plus translations when present). */
++fun SyncedLyrics.toLyricInfoJson(song: Song, packageName: String): String? {
++    if (!hasContent) return null
++
++    val lrc = StringBuilder()
++    val translation = StringBuilder()
++    for (line in lines) {
++        val stamp = lrcTimestamp(line.start)
++        lrc.append(stamp).append(line.content.content.singleLine()).append('\n')
++        val translated = line.translation
++        if (translated != null && !translated.isEmpty) {
++            translation.append(stamp).append(translated.content.singleLine()).append('\n')
++        }
++    }
++
++    val json = JSONObject()
++        .put("songName", song.title)
++        .put("artist", song.artistName)
++        .put("songId", song.id.toString())
++        .put("lyricType", 0)
++        .put("lyric", lrc.toString())
++        .put("noLyric", false)
++        .put("provider", packageName)
++        .put("source", "$packageName-lyrics")
++        .put(
++            "trackKey",
++            "${song.id}|${song.title.lowercase()}|${song.artistName.lowercase()}|${song.duration / 1000}"
++        )
++        .put("sessionGeneration", 1)
++    if (translation.isNotEmpty()) {
++        json.put("translationLyric", translation.toString())
++    }
++    return json.toString()
++}
++
++private fun lrcTimestamp(ms: Long): String {
++    val minutes = ms / 60_000
++    val seconds = (ms / 1000) % 60
++    val millis = ms % 1000
++    return String.format(Locale.US, "[%02d:%02d.%03d]", minutes, seconds, millis)
++}
++
++private fun String.singleLine() = replace('\r', ' ').replace('\n', ' ')
+diff -ruN a/app/src/main/java/com/mardous/booming/playback/PlaybackService.kt b/app/src/main/java/com/mardous/booming/playback/PlaybackService.kt
+--- a/app/src/main/java/com/mardous/booming/playback/PlaybackService.kt	2026-10-26 09:10:14.455773031 +0000
++++ b/app/src/main/java/com/mardous/booming/playback/PlaybackService.kt	2026-10-26 09:10:55.233938231 +0000
+@@ -73,6 +73,7 @@
+ import com.mardous.booming.data.model.Song
+ import com.mardous.booming.data.model.network.NetworkFeature
+ import com.mardous.booming.data.model.network.ScrobblingService
++import com.mardous.booming.data.repository.LyricsRepository
+ import com.mardous.booming.data.repository.Repository
+ import com.mardous.booming.extensions.showToast
+ import com.mardous.booming.playback.equalizer.EqualizerManager
+@@ -132,6 +133,9 @@
+     private val equalizerManager: EqualizerManager by inject()
+     private val audioOutputObserver: AudioOutputObserver by inject()
+     private val repository: Repository by inject()
++    private val lyricsRepository: LyricsRepository by inject()
++    private var lyricInfoJob: Job? = null
++    private var lyricInfoAttemptedId: String? = null
+ 
+     private val queueStateHolder: QueueStateHolder by inject()
+     private val isInTimelineUpdate = AtomicBoolean(false)
+@@ -701,6 +705,60 @@
+         refreshMediaButtonCustomLayout()
+     }
+ 
++    /**
++     * Resolves synced lyrics for the current item and stores them as MediaMetadata
++     * extras under [LYRIC_INFO_KEY], so ColorOS can show them on the lock screen.
++     * Does nothing if the current item already carries lyric info or was already tried.
++     */
++    private fun publishLyricInfo() {
++        val mediaItem = player.currentMediaItem ?: return
++        if (mediaItem.mediaMetadata.extras?.containsKey(LYRIC_INFO_KEY) == true) return
++        // Try once per track, so pausing/resuming never re-triggers a lyrics download.
++        if (mediaItem.mediaId == lyricInfoAttemptedId) return
++        lyricInfoAttemptedId = mediaItem.mediaId
++
++        lyricInfoJob?.cancel()
++        lyricInfoJob = serviceScope.launch(IO) {
++            val song = repository.songByMediaItem(mediaItem, ignoreBlacklist = true)
++            if (song == Song.emptySong) return@launch
++            val json = resolveSyncedLyrics(lyricsRepository, song)
++                ?.toLyricInfoJson(song, packageName)
++                ?: return@launch
++
++            withContext(Main) {
++                val current = player.currentMediaItem ?: return@withContext
++                // The track may have changed while the lyrics were loading.
++                if (current.mediaId != mediaItem.mediaId) return@withContext
++                val extras = current.mediaMetadata.extras?.let { Bundle(it) } ?: Bundle()
++                extras.putString(LYRIC_INFO_KEY, json)
++                player.replaceMediaItem(
++                    player.currentMediaItemIndex,
++                    current.buildUpon()
++                        .setMediaMetadata(current.mediaMetadata.buildUpon().setExtras(extras).build())
++                        .build()
++                )
++            }
++        }
++    }
++
++    /** Removes lyric info from every queue item except the current one, to keep the queue light. */
++    private fun clearStaleLyricInfo() {
++        val currentIndex = player.currentMediaItemIndex
++        for (i in 0 until player.mediaItemCount) {
++            if (i == currentIndex) continue
++            val item = player.getMediaItemAt(i)
++            val extras = item.mediaMetadata.extras ?: continue
++            if (!extras.containsKey(LYRIC_INFO_KEY)) continue
++            val cleaned = Bundle(extras).apply { remove(LYRIC_INFO_KEY) }
++            player.replaceMediaItem(
++                i,
++                item.buildUpon()
++                    .setMediaMetadata(item.mediaMetadata.buildUpon().setExtras(cleaned).build())
++                    .build()
++            )
++        }
++    }
++
+     override fun onTimelineChanged(timeline: Timeline, reason: Int) {
+         if (reason == Player.TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED) {
+             buildPlayQueue(player) { songs, position ->
+@@ -731,6 +789,7 @@
+     }
+ 
+     override fun onIsPlayingChanged(isPlaying: Boolean) {
++        if (isPlaying) publishLyricInfo()
+         if (!isPlaying) {
+             val currentDurationMs = player.mediaMetadata.durationMs ?: 0
+             if (currentDurationMs > 0) {
+@@ -757,6 +816,9 @@
+ 
+     override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+         val isPlaying = player.isPlaying
++        if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT) lyricInfoAttemptedId = null
++        clearStaleLyricInfo()
++        publishLyricInfo()
+         if (replayGainProcessor.mode.isOn) submitReplayGain(mediaItem)
+ 
+         serviceScope.launch(IO) {
